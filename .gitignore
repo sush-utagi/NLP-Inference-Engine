@@ -1,2 +1,5 @@
 data/
 nli/
+train.json
+test.json
+validation.json
