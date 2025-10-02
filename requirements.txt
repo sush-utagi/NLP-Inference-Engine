@@ -1,9 +1,5 @@
-# Natural Language Inference Project Requirements
-# CITS4012 Natural Language Processing
-
-# Core Deep Learning Framework
 torch
-numpy
+numpy<2.0
 pandas
 scipy
 matplotlib
@@ -15,27 +11,26 @@ textblob
 scikit-learn
 tqdm
 
-# Jupyter Notebook Support
 jupyter
 ipykernel
 notebook
 
 # Data Loading and Processing
-datasets
+# datasets
 # transformers>=4.21.0
 
 # Word Embeddings (Optional - for pretrained embeddings)
 # gensim
 
 # Utilities
-tensorboard
+# tensorboard
 # wandb
 
 # Development and Testing
-pytest
-black
-flake8
+# pytest
+# black
+# flake8
 
 # System and File Handling
-tqdm
-requests
+# tqdm
+# requests
