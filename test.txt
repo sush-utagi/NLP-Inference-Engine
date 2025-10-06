@@ -1,0 +1,413 @@
+class BiRNNModel(nn.Module):
+    """Bidirectional RNN model for Natural Language Inference (simple, solid baseline).
+       - Shared embedding + shared BiRNN encoder for premise/hypothesis
+       - Representation = concat of last forward/backward hidden states (top layer)
+       - Features = [p, h, |p-h|, p*h] -> small MLP -> logits
+    """
+    def __init__(self, vocab_size, embedding_dim=128, hidden_dim=128,
+                 num_layers=1, dropout=0.2, rnn_type='LSTM', padding_idx=0, num_classes=2):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.rnn_type = rnn_type.upper()
+
+        # Embedding
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=padding_idx)
+
+        # BiRNN (dropout only applies between stacked layers; set to 0 if single layer)
+        rnn_dropout = dropout if num_layers > 1 else 0.0
+        if self.rnn_type == 'LSTM':
+            self.rnn = nn.LSTM(embedding_dim, hidden_dim, num_layers,
+                               batch_first=True, bidirectional=True, dropout=rnn_dropout)
+        elif self.rnn_type == 'GRU':
+            self.rnn = nn.GRU(embedding_dim, hidden_dim, num_layers,
+                              batch_first=True, bidirectional=True, dropout=rnn_dropout)
+        else:  # vanilla RNN (tanh)
+            self.rnn = nn.RNN(embedding_dim, hidden_dim, num_layers,
+                              batch_first=True, bidirectional=True, nonlinearity='tanh', dropout=rnn_dropout)
+
+        self.dropout = nn.Dropout(dropout)
+
+        # Classifier on [p, h, |p-h|, p*h] (each p/h is 2*hidden_dim)
+        feat_dim = (hidden_dim * 2) * 4
+        self.classifier = nn.Sequential(
+            nn.Linear(feat_dim, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, num_classes)  # 2 classes: entails / neutral
+        )
+
+    def _encode(self, x_ids, x_lengths):
+        """
+        Encode a sequence with BiRNN and return the last hidden state concat (fwd||bwd) from top layer.
+        Args:
+            x_ids:      (B, T) long
+            x_lengths:  (B,)  long or int tensor with true lengths (>=1)
+        Returns:
+            rep: (B, 2H)
+        """
+        emb = self.embedding(x_ids)  # (B, T, E)
+        # pack for efficient/padded-safe RNN
+        x_lengths = torch.clamp(x_lengths, min=1).to(x_ids.device)
+        packed = nn.utils.rnn.pack_padded_sequence(emb, x_lengths.cpu(), batch_first=True, enforce_sorted=False)
+        if self.rnn_type == 'LSTM':
+            _, (h_n, _) = self.rnn(packed)  # h_n: (num_layers*2, B, H)
+        else:
+            _, h_n = self.rnn(packed)       # h_n: (num_layers*2, B, H)
+
+        # take top layer forward and backward states
+        # layout in bidirectional: [layer0_fwd, layer0_bwd, ..., layerL-1_fwd, layerL-1_bwd]
+        fwd_top = h_n[-2, :, :]  # (B, H)
+        bwd_top = h_n[-1, :, :]  # (B, H)
+        rep = torch.cat([fwd_top, bwd_top], dim=-1)  # (B, 2H)
+        rep = self.dropout(rep)
+        return rep
+
+    def forward(self, premise, hypothesis, premise_lengths, hypothesis_lengths):
+        """
+        Args:
+            premise:            (B, T) long
+            hypothesis:         (B, T) long
+            premise_lengths:    (B,)  long
+            hypothesis_lengths: (B,)  long
+        Returns:
+            logits: (B, num_classes)
+        """
+        p = self._encode(premise, premise_lengths)      # (B, 2H)
+        h = self._encode(hypothesis, hypothesis_lengths)# (B, 2H)
+
+        feats = torch.cat([p, h, torch.abs(p - h), p * h], dim=-1)  # (B, 8H)
+        logits = self.classifier(feats)  # (B, C)
+        return logits
+    
+
+
+
+
+# ---------------------------
+# Encoder
+# ---------------------------
+class EncoderRNN(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_size, embedding=None, dropout=0.3):
+        super().__init__()
+        self.hidden_size = hidden_size
+        if embedding is not None:
+            self.embedding = embedding
+        else:
+            self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.gru = nn.GRU(embed_dim, hidden_size, batch_first=True, bidirectional=True)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, src, src_len):
+        # src: [batch, seq_len]
+        embedded = self.dropout(self.embedding(src))  # [B, L, D]
+        packed = nn.utils.rnn.pack_padded_sequence(embedded, src_len.cpu(), batch_first=True, enforce_sorted=False)
+        outputs, hidden = self.gru(packed)  # hidden: [2, B, H]
+        outputs, _ = nn.utils.rnn.pad_packed_sequence(outputs, batch_first=True)  # [B, L, 2H]
+        return outputs, hidden  # outputs = encoder states
+
+
+# ---------------------------
+# Attention (Luong)
+# ---------------------------
+class LuongAttention(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.attn = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, decoder_hidden, encoder_outputs, mask=None):
+        # decoder_hidden: [B, H]
+        # encoder_outputs: [B, L, H]
+        # Compute attention scores
+        attn_scores = torch.bmm(encoder_outputs, decoder_hidden.unsqueeze(2)).squeeze(2)  # [B, L]
+        if mask is not None:
+            attn_scores.masked_fill_(~mask, -1e9)
+        attn_weights = F.softmax(attn_scores, dim=1)  # [B, L]
+        context = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs).squeeze(1)  # [B, H]
+        return context, attn_weights
+
+
+# ---------------------------
+# Decoder
+# ---------------------------
+class DecoderRNN(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_size, embedding=None, dropout=0.3):
+        super().__init__()
+        self.hidden_size = hidden_size
+        if embedding is not None:
+            self.embedding = embedding
+        else:
+            self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+
+        self.gru = nn.GRU(embed_dim + hidden_size, hidden_size, batch_first=True)
+        self.attention = LuongAttention(hidden_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, tgt, tgt_len, encoder_outputs, encoder_mask):
+        # tgt: [B, L_t]
+        embedded = self.dropout(self.embedding(tgt))  # [B, L_t, D]
+        batch_size, L_t, _ = embedded.size()
+
+        hidden = torch.zeros(1, batch_size, self.hidden_size, device=tgt.device)
+        outputs = []
+
+        for t in range(L_t):
+            input_step = embedded[:, t, :]  # [B, D]
+            context, attn_weights = self.attention(hidden.squeeze(0), encoder_outputs, encoder_mask)  # [B, H]
+            rnn_input = torch.cat([input_step, context], dim=1).unsqueeze(1)  # [B, 1, D+H]
+            output, hidden = self.gru(rnn_input, hidden)  # output: [B,1,H]
+            outputs.append(output)
+
+        outputs = torch.cat(outputs, dim=1)  # [B, L_t, H]
+        return outputs  # decoder outputs
+
+
+# ---------------------------
+# Combined Model
+# ---------------------------
+class NLIModelWithAttention(nn.Module):
+    def __init__(self, vocab_size, embed_dim=100, hidden_size=128, embedding=None, dropout=0.3):
+        super().__init__()
+        self.encoder = EncoderRNN(vocab_size, embed_dim, hidden_size, embedding, dropout)
+        self.decoder = DecoderRNN(vocab_size, embed_dim, hidden_size, embedding, dropout)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 2)  # 2 classes: entailment, neutral
+        )
+
+    def make_mask(self, seq, seq_len):
+        mask = torch.arange(seq.size(1), device=seq.device).unsqueeze(0) < seq_len.unsqueeze(1)
+        return mask  # [B, L]
+
+    def forward(self, premise, hypothesis, premise_len, hypothesis_len):
+        # Encode premise
+        encoder_outputs, _ = self.encoder(premise, premise_len)  # [B, Lp, 2H]
+        # Project to single direction size
+        encoder_outputs = encoder_outputs[:, :, :self.encoder.hidden_size] + encoder_outputs[:, :, self.encoder.hidden_size:]
+        encoder_mask = self.make_mask(premise, premise_len)
+
+        # Decode hypothesis
+        decoder_outputs = self.decoder(hypothesis, hypothesis_len, encoder_outputs, encoder_mask)  # [B, Lh, H]
+        # Pooling
+        premise_repr = torch.mean(encoder_outputs, dim=1)  # [B, H]
+        hypothesis_repr = torch.mean(decoder_outputs, dim=1)  # [B, H]
+
+        # Combine and classify
+        combined = torch.cat([premise_repr, hypothesis_repr], dim=1)
+        logits = self.classifier(combined)
+        return logits
+    
+
+
+
+
+# ------------------------------
+# Model 3: Transformer-based NLI
+# ------------------------------
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Positional Encoding (reuse your previous code)
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: (B, T, E)
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+# Transformer NLI Model
+class TransformerNLI(nn.Module):
+    def __init__(self, vocab_size, embed_dim=128, nhead=4, hidden_dim=256, nlayers=2, dropout=0.2, num_classes=2):
+        super().__init__()
+        from torch.nn import TransformerEncoder, TransformerEncoderLayer
+
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.pos_encoder = PositionalEncoding(embed_dim, dropout)
+
+        encoder_layer = TransformerEncoderLayer(d_model=embed_dim, nhead=nhead,
+                                                dim_feedforward=hidden_dim, dropout=dropout)
+        self.transformer_encoder = TransformerEncoder(encoder_layer, num_layers=nlayers)
+        self.dropout = nn.Dropout(dropout)
+
+        # Classifier: [p, h, |p-h|, p*h]
+        feat_dim = embed_dim * 4
+        self.classifier = nn.Sequential(
+            nn.Linear(feat_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes)
+        )
+
+    def _encode(self, x, lengths):
+        # x: (B, T)
+        emb = self.embedding(x) * math.sqrt(self.embedding.embedding_dim)
+        emb = self.pos_encoder(emb)  # (B, T, E)
+        emb = emb.transpose(0, 1)  # (T, B, E)
+        mask = self._generate_pad_mask(x, lengths)  # (B, T)
+        out = self.transformer_encoder(emb, src_key_padding_mask=mask)  # (T, B, E)
+        out = out.transpose(0, 1)  # (B, T, E)
+        # Mean pooling (ignore padded tokens)
+        lengths = lengths.unsqueeze(1).to(out.device)
+        pooled = torch.sum(out * (~mask.unsqueeze(-1)), dim=1) / lengths
+        return self.dropout(pooled)
+
+    def _generate_pad_mask(self, x, lengths):
+        # True where padding, shape (B, T)
+        B, T = x.size()
+        mask = torch.arange(T, device=x.device).unsqueeze(0) >= lengths.unsqueeze(1)
+        return mask
+
+    def forward(self, premise, hypothesis, premise_lengths, hypothesis_lengths):
+        p = self._encode(premise, premise_lengths)
+        h = self._encode(hypothesis, hypothesis_lengths)
+        feats = torch.cat([p, h, torch.abs(p - h), p * h], dim=-1)
+        logits = self.classifier(feats)
+        return logits
+
+
+
+
+# Word-to-Index Mappings and Vocabulary Utilities
+
+class Vocabulary:
+    """Vocabulary class for word-to-index mappings"""
+    
+    def __init__(self, vocab_dict=None, min_freq=1):
+        self.word2idx = {}
+        self.idx2word = {}
+        self.word_freq = {}
+        
+        # Special tokens
+        self.PAD_TOKEN = '<PAD>'
+        self.UNK_TOKEN = '<UNK>'
+        
+        # Add special tokens
+        self.word2idx[self.PAD_TOKEN] = 0
+        self.word2idx[self.UNK_TOKEN] = 1
+        self.idx2word[0] = self.PAD_TOKEN
+        self.idx2word[1] = self.UNK_TOKEN
+        
+        if vocab_dict is not None:
+            self.build_vocab(vocab_dict, min_freq)
+    
+    def build_vocab(self, vocab_dict, min_freq=1):
+        """Build vocabulary from word frequency dictionary"""
+        idx = 2  # Start from 2 (0 and 1 are reserved for PAD and UNK)
+        
+        for word, freq in vocab_dict.items():
+            if freq >= min_freq:
+                self.word2idx[word] = idx
+                self.idx2word[idx] = word
+                self.word_freq[word] = freq
+                idx += 1
+    
+    def encode(self, tokens):
+        """Convert tokens to indices"""
+        return [self.word2idx.get(token, self.word2idx[self.UNK_TOKEN]) for token in tokens]
+    
+    def decode(self, indices):
+        """Convert indices to tokens"""
+        return [self.idx2word.get(idx, self.UNK_TOKEN) for idx in indices]
+    
+    def __len__(self):
+        return len(self.word2idx)
+    
+    def get_vocab_size(self):
+        return len(self.word2idx)
+
+
+
+
+class NLIDataset(Dataset):
+    """PyTorch Dataset for NLI data"""
+    
+    def __init__(self, data, vocab, max_length=128):
+        self.data = data
+        self.vocab = vocab
+        self.max_length = max_length
+        
+        # Create label mapping
+        self.label2idx = {'neutral': 0, 'entails': 1}
+        self.idx2label = {0: 'neutral', 1: 'entails'}
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        example = self.data[idx]
+        
+        # Encode tokens
+        premise_indices = self.vocab.encode(example['premise_tokens'])
+        hypothesis_indices = self.vocab.encode(example['hypothesis_tokens'])
+        
+        # Truncate if too long
+        premise_indices = premise_indices[:self.max_length]
+        hypothesis_indices = hypothesis_indices[:self.max_length]
+        
+        # Ensure minimum length of 1 (add padding token if empty)
+        if len(premise_indices) == 0:
+            premise_indices = [0]  # PAD token
+        if len(hypothesis_indices) == 0:
+            hypothesis_indices = [0]  # PAD token
+        
+        # Get label
+        label = self.label2idx[example['label']]
+        
+        return {
+            'premise': torch.tensor(premise_indices, dtype=torch.long),
+            'hypothesis': torch.tensor(hypothesis_indices, dtype=torch.long),
+            'label': torch.tensor(label, dtype=torch.long),
+            'premise_length': len(premise_indices),
+            'hypothesis_length': len(hypothesis_indices)
+        }
+
+
+
+
+from torch.utils.data import Dataset, DataLoader
+
+label2idx = {"entails": 0, "neutral": 1}
+
+# -----------------------------
+# Dataset & Collate
+# -----------------------------
+class NLIDataset(torch.utils.data.Dataset):
+    def __init__(self, data, vocab):
+        self.data = data
+        self.vocab = vocab
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        premise_ids = torch.tensor(self.vocab.encode(item["premise_tokens"]), dtype=torch.long)
+        hypothesis_ids = torch.tensor(self.vocab.encode(item["hypothesis_tokens"]), dtype=torch.long)
+        label = torch.tensor(label2idx[item["label"]], dtype=torch.long)
+        return premise_ids, hypothesis_ids, label
+
+def collate_fn(batch):
+    premises, hypotheses, labels = zip(*batch)
+    premise_lengths = torch.tensor([len(p) for p in premises])
+    hypothesis_lengths = torch.tensor([len(h) for h in hypotheses])
+    
+    padded_premise = nn.utils.rnn.pad_sequence(premises, batch_first=True, padding_value=0)
+    padded_hypothesis = nn.utils.rnn.pad_sequence(hypotheses, batch_first=True, padding_value=0)
+    labels = torch.stack(labels)
+    return padded_premise, premise_lengths, padded_hypothesis, hypothesis_lengths, labels
