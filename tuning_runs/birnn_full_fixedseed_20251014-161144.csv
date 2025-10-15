@@ -1,2 +1,0 @@
-model,embed_dim,hidden_dim,total_params,trainable_params,val_acc,test_acc,val_macro_f1,test_macro_f1,train_time_s,error
-birnn,16,16,199410,8546,,,,,228.35,evaluate_model() got an unexpected keyword argument 'verbose'
